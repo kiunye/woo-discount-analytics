@@ -3,7 +3,7 @@
  * Plugin Name: WooCommerce Discount Analytics
  * Plugin URI: https://github.com/kiunye/woo-discount-analytics
  * Description: Provides visibility and reporting for products discounted via sale prices in WooCommerce.
- * Version: 1.0.0
+ * Version: 1.1.0
  * Author: Chris Mucheke
  * Author URI: https://github.com/kiunye
  * License: GPL-2.0+
@@ -23,7 +23,7 @@ defined( 'ABSPATH' ) || exit;
 /**
  * Plugin constants.
  */
-define( 'WDA_VERSION', '1.0.0' );
+define( 'WDA_VERSION', '1.1.0' );
 define( 'WDA_PLUGIN_FILE', __FILE__ );
 define( 'WDA_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'WDA_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -125,6 +125,7 @@ final class WooDiscountAnalytics {
 	 * Include required files.
 	 */
 	private function includes() {
+		require_once WDA_PLUGIN_DIR . 'includes/class-wda-database.php';
 		require_once WDA_PLUGIN_DIR . 'includes/class-wda-discount-capture.php';
 		require_once WDA_PLUGIN_DIR . 'includes/class-wda-admin-reports.php';
 		require_once WDA_PLUGIN_DIR . 'includes/class-wda-rest-reports.php';
@@ -134,9 +135,13 @@ final class WooDiscountAnalytics {
 	 * Initialize classes.
 	 */
 	private function init_classes() {
+		WDA_Database::instance();
 		WDA_Discount_Capture::instance();
 		WDA_Admin_Reports::instance();
 		WDA_REST_Reports::instance();
+
+		// Check for database migration on plugin load.
+		$this->check_database_migration();
 	}
 
 	/**
@@ -147,8 +152,22 @@ final class WooDiscountAnalytics {
 			return;
 		}
 
+		// Load database class for table creation.
+		require_once WDA_PLUGIN_DIR . 'includes/class-wda-database.php';
+
+		// Create custom table.
+		$database = WDA_Database::instance();
+		$database->create_table();
+
 		// Set version option.
+		$old_version = get_option( 'wda_version', '0.0.0' );
 		update_option( 'wda_version', WDA_VERSION );
+
+		// Run migration if upgrading from 1.0.0.
+		if ( version_compare( $old_version, '1.1.0', '<' ) && version_compare( $old_version, '1.0.0', '>=' ) ) {
+			// Migration will be handled on next page load via check_database_migration.
+			update_option( 'wda_migration_pending', true );
+		}
 
 		// Flush rewrite rules.
 		flush_rewrite_rules();
@@ -164,6 +183,72 @@ final class WooDiscountAnalytics {
 
 		// Flush rewrite rules.
 		flush_rewrite_rules();
+	}
+
+	/**
+	 * Check if database migration is needed.
+	 */
+	private function check_database_migration() {
+		// Only run in admin and if migration is pending.
+		if ( ! is_admin() ) {
+			return;
+		}
+
+		// Ensure database class is loaded.
+		if ( ! class_exists( 'WDA_Database' ) ) {
+			return;
+		}
+
+		try {
+			$migration_pending = get_option( 'wda_migration_pending', false );
+			$db_version = get_option( 'wda_db_version', '0.0.0' );
+
+			// If table doesn't exist or migration is pending, ensure table exists.
+			$database = WDA_Database::instance();
+			if ( $database && ! $database->table_exists() ) {
+				$database->create_table();
+			}
+
+			// Run migration if pending and table exists.
+			if ( $migration_pending && $database && $database->table_exists() ) {
+				// Run migration in background (non-blocking).
+				add_action( 'admin_init', array( $this, 'run_migration' ), 20 );
+			}
+		} catch ( Exception $e ) {
+			// Silently fail - don't break the plugin if migration has issues.
+			error_log( 'WDA Migration Error: ' . $e->getMessage() );
+		}
+	}
+
+	/**
+	 * Run database migration.
+	 */
+	public function run_migration() {
+		// Only run once per request.
+		if ( get_transient( 'wda_migration_running' ) ) {
+			return;
+		}
+
+		set_transient( 'wda_migration_running', true, 60 );
+
+		$database = WDA_Database::instance();
+		$results = $database->migrate_meta_to_table();
+
+		// Clear migration pending flag.
+		delete_option( 'wda_migration_pending' );
+
+		// Show admin notice if migration completed.
+		if ( $results['success'] && $results['migrated'] > 0 ) {
+			add_action( 'admin_notices', function() use ( $results ) {
+				?>
+				<div class="notice notice-success is-dismissible">
+					<p><?php echo esc_html( $results['message'] ); ?></p>
+				</div>
+				<?php
+			} );
+		}
+
+		delete_transient( 'wda_migration_running' );
 	}
 }
 

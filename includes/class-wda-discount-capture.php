@@ -66,6 +66,9 @@ class WDA_Discount_Capture {
 
 		// Also capture on order creation for immediate processing orders.
 		add_action( 'woocommerce_checkout_order_created', array( $this, 'on_order_created' ), 10, 1 );
+
+		// Hook into refund creation.
+		add_action( 'woocommerce_refund_created', array( $this, 'on_refund_created' ), 10, 2 );
 	}
 
 	/**
@@ -189,12 +192,36 @@ class WDA_Discount_Capture {
 			}
 		}
 
-		// Store the captured data.
+		// Store the captured data in order item meta (backward compatibility).
 		wc_update_order_item_meta( $item_id, self::META_REGULAR_PRICE, $regular_price );
 		wc_update_order_item_meta( $item_id, self::META_SALE_PRICE, $unit_subtotal );
 		wc_update_order_item_meta( $item_id, self::META_DISCOUNT_AMOUNT, round( $discount_amount, 4 ) );
 		wc_update_order_item_meta( $item_id, self::META_DISCOUNT_PCT, round( $discount_pct, 2 ) );
 		wc_update_order_item_meta( $item_id, self::META_WAS_ON_SALE, $was_on_sale ? 'yes' : 'no' );
+
+		// Also store in custom table if it exists (dual-write for migration period).
+		$database = WDA_Database::instance();
+		if ( $database->table_exists() ) {
+			$order_date = $order->get_date_created();
+			$insert_data = array(
+				'order_id'          => $order->get_id(),
+				'order_item_id'     => $item_id,
+				'product_id'        => $product_id,
+				'variation_id'      => $variation_id,
+				'regular_price'     => floatval( $regular_price ),
+				'sale_price'        => $unit_subtotal,
+				'discount_amount'   => round( $discount_amount, 4 ),
+				'discount_percentage' => round( $discount_pct, 2 ),
+				'quantity'          => $quantity,
+				'currency'          => $order->get_currency(),
+				'created_at'        => $order_date ? $order_date->format( 'Y-m-d H:i:s' ) : current_time( 'mysql' ),
+			);
+
+			// Only insert if this item was on sale.
+			if ( $was_on_sale ) {
+				$database->insert_discount( $insert_data );
+			}
+		}
 
 		do_action( 'wda_item_discount_captured', $item_id, $item, $order, array(
 			'regular_price'   => $regular_price,
@@ -237,6 +264,24 @@ class WDA_Discount_Capture {
 	 * @return array|false Discount data or false if not captured.
 	 */
 	public static function get_item_discount_data( $item_id ) {
+		// Try to get from custom table first (preferred).
+		$database = WDA_Database::instance();
+		if ( $database->table_exists() ) {
+			$table_data = $database->get_discount_by_item_id( $item_id );
+			if ( $table_data ) {
+				return array(
+					'regular_price'   => floatval( $table_data['regular_price'] ),
+					'sale_price'      => floatval( $table_data['sale_price'] ),
+					'discount_amount' => floatval( $table_data['discount_amount'] ),
+					'discount_pct'    => floatval( $table_data['discount_percentage'] ),
+					'was_on_sale'     => 'yes',
+					'currency'        => $table_data['currency'],
+					'quantity'        => floatval( $table_data['quantity'] ),
+				);
+			}
+		}
+
+		// Fallback to order item meta (backward compatibility).
 		$was_on_sale = wc_get_order_item_meta( $item_id, self::META_WAS_ON_SALE, true );
 
 		if ( '' === $was_on_sale ) {
@@ -268,5 +313,47 @@ class WDA_Discount_Capture {
 		}
 
 		return $order->get_meta( self::META_CAPTURED ) === 'yes';
+	}
+
+	/**
+	 * Handle refund creation.
+	 *
+	 * Marks discount entries as refunded when an order is refunded.
+	 *
+	 * @param int       $refund_id Refund ID.
+	 * @param array     $args      Refund arguments.
+	 */
+	public function on_refund_created( $refund_id, $args ) {
+		$refund = wc_get_order( $refund_id );
+		if ( ! $refund || ! is_a( $refund, 'WC_Order_Refund' ) ) {
+			return;
+		}
+
+		$parent_order_id = $refund->get_parent_id();
+		$parent_order = wc_get_order( $parent_order_id );
+		if ( ! $parent_order ) {
+			return;
+		}
+
+		$database = WDA_Database::instance();
+		if ( ! $database->table_exists() ) {
+			return;
+		}
+
+		$refunded_at = $refund->get_date_created();
+		$refunded_at_str = $refunded_at ? $refunded_at->format( 'Y-m-d H:i:s' ) : current_time( 'mysql' );
+
+		// Get refunded line items.
+		$refunded_items = $refund->get_items( 'line_item' );
+
+		foreach ( $refunded_items as $refunded_item ) {
+			$original_item_id = $refunded_item->get_meta( '_refunded_item_id' );
+			if ( $original_item_id ) {
+				// Mark the original discount entry as refunded.
+				$database->mark_as_refunded( $original_item_id, $refund_id, $refunded_at_str );
+			}
+		}
+
+		do_action( 'wda_refund_processed', $refund_id, $parent_order_id );
 	}
 }

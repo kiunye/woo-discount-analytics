@@ -137,12 +137,16 @@ class WDA_REST_Reports {
 			'discount_min'    => array(
 				'type'              => 'number',
 				'default'           => 0,
-				'sanitize_callback' => 'floatval',
+				'sanitize_callback' => function( $value ) {
+					return floatval( $value );
+				},
 			),
 			'discount_max'    => array(
 				'type'              => 'number',
 				'default'           => 100,
-				'sanitize_callback' => 'floatval',
+				'sanitize_callback' => function( $value ) {
+					return floatval( $value );
+				},
 			),
 			'sale_status'     => array(
 				'type'              => 'string',
@@ -417,6 +421,150 @@ class WDA_REST_Reports {
 		$category   = $request->get_param( 'category' );
 		$group_by   = $request->get_param( 'group_by' );
 
+		$results = array();
+
+		// Try to read from custom table first (preferred method).
+		if ( class_exists( 'WDA_Database' ) ) {
+			$database = WDA_Database::instance();
+			if ( $database && $database->table_exists() ) {
+				$results = $this->get_discount_history_from_table( $date_from, $date_to, $product_id, $category );
+			} else {
+				// Fallback to order item meta method (backward compatibility).
+				$results = $this->get_discount_history_from_meta( $date_from, $date_to, $product_id, $category );
+			}
+		} else {
+			// Fallback to order item meta method (backward compatibility).
+			$results = $this->get_discount_history_from_meta( $date_from, $date_to, $product_id, $category );
+		}
+
+		// Handle grouping.
+		if ( ! empty( $group_by ) ) {
+			$results = $this->group_history_results( $results, $group_by );
+		}
+
+		$total = count( $results );
+
+		// Paginate.
+		$offset  = ( $page - 1 ) * $per_page;
+		$results = array_slice( $results, $offset, $per_page );
+
+		return new WP_REST_Response( array(
+			'items'       => array_values( $results ),
+			'total'       => $total,
+			'total_pages' => ceil( $total / $per_page ),
+			'page'        => $page,
+			'per_page'    => $per_page,
+		), 200 );
+	}
+
+	/**
+	 * Get discount history from custom table.
+	 *
+	 * @param string $date_from  Date from.
+	 * @param string $date_to    Date to.
+	 * @param int    $product_id Product ID filter.
+	 * @param int    $category   Category ID filter.
+	 * @return array
+	 */
+	private function get_discount_history_from_table( $date_from, $date_to, $product_id, $category ) {
+		global $wpdb;
+
+		if ( ! class_exists( 'WDA_Database' ) ) {
+			return array();
+		}
+
+		$database = WDA_Database::instance();
+		$table_name = WDA_Database::get_table_name();
+		$results = array();
+
+		// Build WHERE clause.
+		$where = array( 'refund_id = 0' ); // Only non-refunded items.
+
+		if ( ! empty( $date_from ) ) {
+			$where[] = $wpdb->prepare( 'created_at >= %s', $date_from );
+		}
+
+		if ( ! empty( $date_to ) ) {
+			$where[] = $wpdb->prepare( 'created_at <= %s', $date_to . ' 23:59:59' );
+		}
+
+		if ( $product_id > 0 ) {
+			$where[] = $wpdb->prepare( 'product_id = %d', $product_id );
+		}
+
+		$where_clause = 'WHERE ' . implode( ' AND ', $where );
+
+		// Query custom table.
+		$discounts = $wpdb->get_results(
+			"SELECT * FROM {$table_name} {$where_clause} ORDER BY created_at DESC",
+			ARRAY_A
+		);
+
+		foreach ( $discounts as $discount ) {
+			$order_id = absint( $discount['order_id'] );
+			$order = wc_get_order( $order_id );
+
+			if ( ! $order ) {
+				continue;
+			}
+
+			// Filter by category if specified.
+			if ( $category > 0 ) {
+				$product_categories = wp_get_post_terms( $discount['product_id'], 'product_cat', array( 'fields' => 'ids' ) );
+				if ( ! in_array( $category, $product_categories, true ) ) {
+					continue;
+				}
+			}
+
+			// Get product name.
+			$product = wc_get_product( $discount['product_id'] );
+			$product_name = $product ? $product->get_name() : sprintf( __( 'Product #%d', 'woo-discount-analytics' ), $discount['product_id'] );
+
+			// Get order item for line total.
+			$order_item = $order->get_item( $discount['order_item_id'] );
+			$line_total = $order_item ? floatval( $order_item->get_total() ) : 0;
+
+			// Calculate ERP-ready price decomposition.
+			$gross_unit_price = floatval( $discount['regular_price'] );
+			$line_discount = floatval( $discount['discount_amount'] );
+			$net_unit_price = floatval( $discount['sale_price'] );
+			$net_line_amount = $net_unit_price * floatval( $discount['quantity'] );
+
+			$results[] = array(
+				'order_id'          => $order_id,
+				'order_date'        => $discount['created_at'],
+				'item_id'           => absint( $discount['order_item_id'] ),
+				'product_id'        => absint( $discount['product_id'] ),
+				'variation_id'      => absint( $discount['variation_id'] ),
+				'product_name'      => $product_name,
+				'quantity'          => floatval( $discount['quantity'] ),
+				'regular_price'     => $gross_unit_price,
+				'sale_price'        => $net_unit_price,
+				'discount_amount'   => $line_discount,
+				'discount_pct'      => floatval( $discount['discount_percentage'] ),
+				'line_total'        => $line_total,
+				'currency'          => $discount['currency'],
+				// ERP-ready price decomposition.
+				'gross_unit_price'  => $gross_unit_price,
+				'line_discount'     => $line_discount,
+				'net_unit_price'    => $net_unit_price,
+				'net_line_amount'   => $net_line_amount,
+			);
+		}
+
+		return $results;
+	}
+
+	/**
+	 * Get discount history from order item meta (backward compatibility).
+	 *
+	 * @param string $date_from  Date from.
+	 * @param string $date_to    Date to.
+	 * @param int    $product_id Product ID filter.
+	 * @param int    $category   Category ID filter.
+	 * @return array
+	 */
+	private function get_discount_history_from_meta( $date_from, $date_to, $product_id, $category ) {
 		// Build order query.
 		$order_args = array(
 			'status'   => array( 'wc-processing', 'wc-completed' ),
@@ -475,41 +623,38 @@ class WDA_REST_Reports {
 				$product_name = $product ? $product->get_name() : $item->get_name();
 
 				$date_created = $order->get_date_created();
+
+				// Calculate ERP-ready price decomposition.
+				$gross_unit_price = floatval( $discount_data['regular_price'] );
+				$line_discount = floatval( $discount_data['discount_amount'] );
+				$net_unit_price = floatval( $discount_data['sale_price'] );
+				$quantity = floatval( $item->get_quantity() );
+				$net_line_amount = $net_unit_price * $quantity;
+
 				$results[] = array(
-					'order_id'        => $order_id,
-					'order_date'      => $date_created ? $date_created->format( 'Y-m-d H:i:s' ) : '',
-					'item_id'         => $item_id,
-					'product_id'      => $item_product_id,
-					'variation_id'    => $item->get_variation_id(),
-					'product_name'    => $product_name,
-					'quantity'        => $item->get_quantity(),
-					'regular_price'   => floatval( $discount_data['regular_price'] ),
-					'sale_price'      => floatval( $discount_data['sale_price'] ),
-					'discount_amount' => floatval( $discount_data['discount_amount'] ),
-					'discount_pct'    => floatval( $discount_data['discount_pct'] ),
-					'line_total'      => floatval( $item->get_total() ),
+					'order_id'          => $order_id,
+					'order_date'        => $date_created ? $date_created->format( 'Y-m-d H:i:s' ) : '',
+					'item_id'           => $item_id,
+					'product_id'        => $item_product_id,
+					'variation_id'      => $item->get_variation_id(),
+					'product_name'      => $product_name,
+					'quantity'          => $quantity,
+					'regular_price'     => $gross_unit_price,
+					'sale_price'        => $net_unit_price,
+					'discount_amount'   => $line_discount,
+					'discount_pct'      => floatval( $discount_data['discount_pct'] ),
+					'line_total'        => floatval( $item->get_total() ),
+					'currency'          => $order->get_currency(),
+					// ERP-ready price decomposition.
+					'gross_unit_price'  => $gross_unit_price,
+					'line_discount'     => $line_discount,
+					'net_unit_price'    => $net_unit_price,
+					'net_line_amount'   => $net_line_amount,
 				);
 			}
 		}
 
-		// Handle grouping.
-		if ( ! empty( $group_by ) ) {
-			$results = $this->group_history_results( $results, $group_by );
-		}
-
-		$total = count( $results );
-
-		// Paginate.
-		$offset  = ( $page - 1 ) * $per_page;
-		$results = array_slice( $results, $offset, $per_page );
-
-		return new WP_REST_Response( array(
-			'items'       => array_values( $results ),
-			'total'       => $total,
-			'total_pages' => ceil( $total / $per_page ),
-			'page'        => $page,
-			'per_page'    => $per_page,
-		), 200 );
+		return $results;
 	}
 
 	/**
@@ -614,6 +759,122 @@ class WDA_REST_Reports {
 		$date_from = $request->get_param( 'date_from' );
 		$date_to   = $request->get_param( 'date_to' );
 
+		// Try to read from custom table first (preferred method).
+		if ( class_exists( 'WDA_Database' ) ) {
+			$database = WDA_Database::instance();
+			if ( $database && $database->table_exists() ) {
+				return $this->get_discount_summary_from_table( $date_from, $date_to );
+			}
+		}
+
+		// Fallback to order item meta method (backward compatibility).
+		return $this->get_discount_summary_from_meta( $date_from, $date_to );
+	}
+
+	/**
+	 * Get discount summary from custom table.
+	 *
+	 * @param string $date_from Date from.
+	 * @param string $date_to   Date to.
+	 * @return WP_REST_Response
+	 */
+	private function get_discount_summary_from_table( $date_from, $date_to ) {
+		global $wpdb;
+
+		if ( ! class_exists( 'WDA_Database' ) ) {
+			return $this->get_discount_summary_from_meta( $date_from, $date_to );
+		}
+
+		$database = WDA_Database::instance();
+		$table_name = WDA_Database::get_table_name();
+
+		// Build WHERE clause.
+		$where = array( 'refund_id = 0' ); // Only non-refunded items.
+
+		if ( ! empty( $date_from ) ) {
+			$where[] = $wpdb->prepare( 'created_at >= %s', $date_from );
+		}
+
+		if ( ! empty( $date_to ) ) {
+			$where[] = $wpdb->prepare( 'created_at <= %s', $date_to . ' 23:59:59' );
+		}
+
+		$where_clause = 'WHERE ' . implode( ' AND ', $where );
+
+		// Get all discount entries.
+		$discounts = $wpdb->get_results(
+			"SELECT * FROM {$table_name} {$where_clause}",
+			ARRAY_A
+		);
+
+		$total_discount     = 0;
+		$total_revenue      = 0;
+		$discounted_units   = 0;
+		$product_discounts = array();
+		$order_ids         = array();
+
+		foreach ( $discounts as $discount ) {
+			$order_id = absint( $discount['order_id'] );
+			if ( ! in_array( $order_id, $order_ids, true ) ) {
+				$order_ids[] = $order_id;
+			}
+
+			$quantity = floatval( $discount['quantity'] );
+			$line_discount = floatval( $discount['discount_amount'] ) * $quantity;
+			$net_line_amount = floatval( $discount['sale_price'] ) * $quantity;
+
+			$total_discount   += $line_discount;
+			$discounted_units += $quantity;
+			$total_revenue    += $net_line_amount;
+
+			$product_id = absint( $discount['product_id'] );
+			if ( ! isset( $product_discounts[ $product_id ] ) ) {
+				$product = wc_get_product( $product_id );
+				$product_name = $product ? $product->get_name() : sprintf( __( 'Product #%d', 'woo-discount-analytics' ), $product_id );
+				$product_discounts[ $product_id ] = array(
+					'product_id'     => $product_id,
+					'product_name'   => $product_name,
+					'total_discount' => 0,
+					'units_sold'     => 0,
+				);
+			}
+			$product_discounts[ $product_id ]['total_discount'] += $line_discount;
+			$product_discounts[ $product_id ]['units_sold']     += $quantity;
+		}
+
+		// Sort products by discount amount.
+		usort( $product_discounts, function( $a, $b ) {
+			return $b['total_discount'] <=> $a['total_discount'];
+		} );
+
+		// Get top 10.
+		$top_discounted = array_slice( $product_discounts, 0, 10 );
+
+		// Round values.
+		foreach ( $top_discounted as &$product ) {
+			$product['total_discount'] = round( $product['total_discount'], 2 );
+		}
+
+		$discount_pct_of_revenue = $total_revenue > 0 ? ( $total_discount / $total_revenue ) * 100 : 0;
+
+		return new WP_REST_Response( array(
+			'total_discount'          => round( $total_discount, 2 ),
+			'total_revenue'           => round( $total_revenue, 2 ),
+			'discount_pct_of_revenue' => round( $discount_pct_of_revenue, 2 ),
+			'discounted_units'        => $discounted_units,
+			'orders_count'            => count( $order_ids ),
+			'top_discounted_products' => $top_discounted,
+		), 200 );
+	}
+
+	/**
+	 * Get discount summary from order item meta (backward compatibility).
+	 *
+	 * @param string $date_from Date from.
+	 * @param string $date_to   Date to.
+	 * @return WP_REST_Response
+	 */
+	private function get_discount_summary_from_meta( $date_from, $date_to ) {
 		// Build order query.
 		$order_args = array(
 			'status'  => array( 'wc-processing', 'wc-completed' ),
