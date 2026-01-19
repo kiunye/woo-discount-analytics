@@ -96,8 +96,23 @@ When an order status changes to "Processing" or "Completed", the plugin captures
 - Sale price (actual price paid)
 - Discount amount and percentage
 - Whether the product was on sale
+- Currency (for multi-currency support)
 
-This data is stored in order item meta and used for historical reporting.
+This data is stored in both order item meta (for backward compatibility) and a custom database table (`wc_sale_price_discounts`) for improved performance and ERP integration.
+
+### Refund Handling
+
+When orders are refunded, the plugin automatically marks the corresponding discount entries as refunded, maintaining accurate historical records and ensuring refunded discounts are excluded from reports.
+
+### ERP Integration
+
+The plugin provides ERP-ready price decomposition in REST API responses, explicitly separating:
+- Gross unit price (regular price)
+- Line discount (sale price discount)
+- Net unit price (sale price)
+- Net line amount (sale price × quantity)
+
+This structure is designed for seamless integration with ERP systems like Dynamics 365, ensuring correct G/L posting of line discounts vs invoice discounts.
 
 ### Current Discounts
 
@@ -118,7 +133,8 @@ This plugin is fully compatible with WooCommerce's High-Performance Order Storag
 woo-discount-analytics/
 ├── woo-discount-analytics.php    # Main plugin file
 ├── includes/
-│   ├── class-wda-admin-reports.php   # Admin menu and pages
+│   ├── class-wda-database.php         # Database table management
+│   ├── class-wda-admin-reports.php    # Admin menu and pages
 │   ├── class-wda-discount-capture.php # Order data capture
 │   └── class-wda-rest-reports.php    # REST API endpoints
 ├── assets/
@@ -134,11 +150,20 @@ The plugin registers the following REST API endpoints under the `wda/v1` namespa
 | Endpoint | Description |
 |----------|-------------|
 | `GET /current-discounts` | Get products with sale prices |
-| `GET /discount-history` | Get historical discount data |
+| `GET /discount-history` | Get historical discount data (includes ERP-ready price decomposition) |
 | `GET /discount-summary` | Get aggregate discount metrics |
 | `GET /export/{type}` | Export report data as CSV |
 
 All endpoints require `manage_woocommerce` capability.
+
+### ERP-Ready Data Structure
+
+The `/discount-history` endpoint includes explicit price decomposition fields for ERP integration:
+- `gross_unit_price` - Regular unit price
+- `line_discount` - Line discount amount
+- `net_unit_price` - Sale unit price
+- `net_line_amount` - Net line total (sale price × quantity)
+- `currency` - Order currency code
 
 ## Hooks & Filters
 
@@ -147,10 +172,26 @@ All endpoints require `manage_woocommerce` capability.
 - `wda_loaded` - Fired after the plugin is fully loaded
 - `wda_discount_data_captured` - Fired after discount data is captured for an order
 - `wda_item_discount_captured` - Fired after discount data is captured for a single item
+- `wda_refund_processed` - Fired after refund discount entries are processed
+
+### Data Storage
+
+The plugin uses a dual-storage approach for backward compatibility:
+
+**Custom Database Table** (`wc_sale_price_discounts`):
+- Primary storage for version 1.1.0+
+- Improved query performance
+- Supports multi-currency (currency stored per row)
+- Tracks refund status
+- Indexed for fast lookups
+
+**Order Item Meta** (backward compatibility):
+- Maintained for existing installations
+- Automatically migrated to custom table on upgrade
 
 ### Meta Keys
 
-The plugin stores the following order item meta:
+The plugin stores the following order item meta (for backward compatibility):
 
 | Meta Key | Description |
 |----------|-------------|
@@ -167,6 +208,15 @@ Order-level meta:
 | `_wda_captured` | Whether discount data has been captured (yes) |
 
 ## Changelog
+
+### 1.1.0
+- Custom database table for improved performance and ERP integration
+- Multi-currency support (currency stored per order line item)
+- Refund handling with automatic discount entry tracking
+- ERP-ready price decomposition in REST API responses
+- Automatic migration from order item meta to custom table
+- Dual-write architecture for seamless upgrade path
+- Enhanced data structure for Dynamics 365 and other ERP integrations
 
 ### 1.0.0
 - Initial release
